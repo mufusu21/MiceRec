@@ -3,7 +3,7 @@ MiceRec code for SDM 2022
 
 Our experimental code is implemented in Python 3.6 using TensorFlow 1.13.1.
 
-Datasets detail is follow paper ComiRec: Controllable Multi-Interest Framework for Recommendation  (https://github.com/THUDM/ComiRec)
+Datasets detail follows paper ComiRec: Controllable Multi-Interest Framework for Recommendation  (https://github.com/THUDM/ComiRec)
 
 http://jmcauley.ucsd.edu/data/amazon/ 
 
