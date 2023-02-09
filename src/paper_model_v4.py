@@ -487,13 +487,358 @@ def get_shape(inputs):
 
 # neg_num = batch_size * neg_num
 class Model_MiceRecSA(Basic_Model):
-    """
-    Due to the time conflict of the company's patent application, 
-    the details of the model part are temporarily invisible. 
-    We will add all the codes after the patent application is successful. 
-    It is expected to be March 2022.
-    Thanks for your patience.
-    """
+    def __init__(self, n_mid, embedding_dim, hidden_size, batch_size, num_interest, item_cate,
+                 item_freq, cate_prop=0, seq_len=256, neg_num=10, add_pos=True,
+                 con_att=True, con_gt_loss_weight=0.1, con_lt_loss_weight=0.1, int_gt_loss_weight=0.1,
+                 int_lt_loss_weight=0.1, dis_loss_weight=0.01, weight_decay=0.9, dis_loss_type='cos'):
+        super(Model_MiceRecSA, self).__init__(n_mid, embedding_dim, hidden_size, batch_size, seq_len, neg_num, item_cate,
+                 item_freq, cate_prop, dis_loss_type, flag="MiceRec-SA")
+        # embedding维度
+        self.dim = embedding_dim
+        self.con_att = con_att
+        self.seq_len = seq_len
+        self.con_gt_loss_weight = con_gt_loss_weight
+        self.con_lt_loss_weight = con_lt_loss_weight
+        self.int_gt_loss_weight = int_gt_loss_weight
+        self.int_lt_loss_weight = int_lt_loss_weight
+        self.dis_loss_weight = dis_loss_weight
+        self.weight_decay = weight_decay
+
+        # (batch_size, max_len, embedding_dim)
+        batch_item_list_int_emb = tf.reshape(self.batch_item_hist_int_embeddings, [-1, seq_len, embedding_dim])
+        batch_item_list_con_emb = tf.reshape(self.batch_item_hist_con_embeddings, [-1, seq_len, embedding_dim])
+
+        if add_pos:
+            # (1, max_len, embedding_dim)
+            self.position_embedding = \
+                tf.get_variable(
+                    shape=[1, seq_len, embedding_dim],
+                    name='position_embedding')
+            # (batch_size, max_len, embedding_dim)
+            batch_item_list_int_add_pos = batch_item_list_int_emb + tf.tile(self.position_embedding,
+                                                                            [tf.shape(batch_item_list_int_emb)[0], 1, 1])
+            batch_item_list_con_add_pos = batch_item_list_con_emb + tf.tile(self.position_embedding,
+                                                                            [tf.shape(batch_item_list_con_emb)[0], 1, 1])
+        else:
+            # (batch_size, max_len, embedding_dim)
+            batch_item_list_int_add_pos = batch_item_list_int_emb
+            batch_item_list_con_add_pos = batch_item_list_con_emb
+
+        # 兴趣数量
+        num_heads = num_interest
+
+        # user兴趣emb侧的self-attention
+        with tf.variable_scope("self_atten", reuse=tf.AUTO_REUSE) as scope:
+            # (batch_size, max_len, 4 * hidden_size)
+            user_int_item_hidden = tf.layers.dense(batch_item_list_int_add_pos, hidden_size * 4, activation=tf.nn.tanh)
+
+            # (batch_size, max_len, num_heads)
+            user_int_item_att_w = tf.layers.dense(user_int_item_hidden, num_heads, activation=None)
+
+            # (batch_size, num_heads, max_len)
+            user_int_item_att_w = tf.transpose(user_int_item_att_w, [0, 2, 1])
+
+            # tf.expand_dims(self.mask, axis=1) -> (batch_size, 1, max_len)
+            # atten_mask -> (batch_size, num_heads, max_len)
+            user_int_atten_mask = tf.tile(tf.expand_dims(self.mask, axis=1), [1, num_heads, 1])
+
+            # paddings: (batch_size, num_heads, max_len)
+            user_int_paddings = tf.ones_like(user_int_atten_mask) * (-2 ** 32 + 1)
+
+            # item_att_w: (batch_size, num_heads, max_len)
+            user_int_item_att_w = tf.where(tf.equal(user_int_atten_mask, 0), user_int_paddings, user_int_item_att_w)
+
+            # item_att_w: (batch_size, num_heads, max_len)
+            user_int_item_att_w = tf.nn.softmax(user_int_item_att_w)
+
+            # interest_emb: (batch_size, num_heads, embedding_dim)
+            user_interest_emb = tf.matmul(user_int_item_att_w, batch_item_list_int_emb)
+
+        # user_eb: (batch_size, num_heads, embedding_dim)
+        self.user_int_embeddings = user_interest_emb
+
+        # user从众侧的embedding
+        if con_att:
+            # user从众侧添加self-attention进行降维 (batch_size, max_len, 4 * hidden_size)
+            user_con_item_hidden = tf.layers.dense(batch_item_list_con_add_pos, hidden_size * 4, activation=tf.nn.tanh)
+
+            # (batch_size, max_len, 1)
+            user_con_item_att_w = tf.layers.dense(user_con_item_hidden, 1, activation=None)
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+
+            # (batch_size, 1, max_len)
+            user_con_item_att_w = tf.transpose(user_con_item_att_w, [0, 2, 1])
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+
+            # tf.expand_dims(self.mask, axis=1) -> (batch_size, 1, max_len)
+            # atten_mask -> (batch_size, 1, max_len)
+            user_con_atten_mask = tf.tile(tf.expand_dims(self.mask, axis=1), [1, 1, 1])
+            # print('user_con_atten_mask shape:', user_con_atten_mask.shape)
+
+            # paddings: (batch_size, 1, max_len)
+            user_con_paddings = tf.ones_like(user_con_atten_mask) * (-2 ** 32 + 1)
+            # print('user_con_paddings shape:', user_con_paddings.shape)
+
+            # item_att_w: (batch_size, 1, max_len)
+            user_con_item_att_w = tf.where(tf.equal(user_con_atten_mask, 0), user_con_paddings, user_con_item_att_w)
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+
+            # item_att_w: (batch_size, 1, max_len)
+            user_con_item_att_w = tf.nn.softmax(user_con_item_att_w)
+
+            # interest_emb: (batch_size, 1, embedding_dim)
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+            # print('batch_item_list_con_emb:', batch_item_list_con_emb.shape)
+            user_conformity_emb = tf.matmul(user_con_item_att_w, batch_item_list_con_emb)
+            # print('user_conformity_emb:', user_conformity_emb.shape)
+
+        else:
+            # user从众直接添加全连接进行降维 先把user_con_item摊平 (batch_size, max_len * embedding_dim)
+            batch_item_list_con_add_pos_flatten = tf.reshape(batch_item_list_con_add_pos,
+                                                             [batch_size, self.seq_len * embedding_dim])
+            # (batch_size, embedding_dim)
+            user_con_item_hidden = tf.layers.dense(batch_item_list_con_add_pos_flatten, embedding_dim, activation=tf.nn.relu)
+
+            # (batch_size, 1, embedding_dim)
+            user_conformity_emb = tf.reshape(user_con_item_hidden, [batch_size, 1, embedding_dim])
+
+        # (batch_size, 1, embedding_dim)
+        self.user_con_embeddings = user_conformity_emb
+
+        # 得到serving阶段的user embedding (batch_size, num_heads + 1, embedding_dim)
+        self.user_embeddings = tf.concat([self.user_con_embeddings, self.user_int_embeddings], axis=1)
+
+        # user兴趣侧 target-aware attention key,value为user_int_embeddings, query为target item 的兴趣embedding
+        # self.user_int_embeddings (batch_size, num_heads, embedding_dim)
+
+        # user_int_embeddings: (batch_size, num_heads, embedding_dim), batch_item_int_embeddings: (batch_size, embedding_dim)
+        # batch_item_list_int_emb: (batch_size, max_len, embedding_dim), get_shape(item_list_emb)[0] = batch_size
+        # tf.reshape(self.batch_item_int_embeddings, [get_shape(batch_item_list_int_emb)[0], self.dim, 1]): (batch_size, embedding_dim, 1)
+        # item_int_target_atten: (batch_size, num_heads, 1)
+        item_int_target_atten = tf.matmul(self.user_int_embeddings, tf.reshape(self.batch_item_int_embeddings,
+                                                                               [get_shape(batch_item_list_int_emb)[0], self.dim, 1]))
+
+        # tf.reshape(item_int_target_atten, [get_shape(batch_item_list_int_emb)[0], num_heads]): (batch_size, num_heads)
+        # tf.pow(tf.reshape(item_int_target_atten, [get_shape(batch_item_list_int_emb)[0], num_heads]), 1): (batch_size, num_heads)
+        # item_int_target_atten: (batch_size, num_heads)
+        item_int_target_atten = tf.nn.softmax(tf.pow(tf.reshape(item_int_target_atten,
+                                                                [get_shape(batch_item_list_int_emb)[0], num_heads]), 1))
+
+        # tf.reshape(self.user_eb, [-1, self.dim]): (batch_size * num_heads, embedding_dim)
+        # tf.argmax(atten, axis=1, output_type=tf.int32): (batch_size, )
+        # tf.range(tf.shape(item_list_emb)[0]) (batch_size, )
+        # user_int_att_emb: (batch_size, embedding_dim)
+        self.user_int_att_emb = tf.gather(tf.reshape(self.user_int_embeddings, [-1, self.dim]),
+                            tf.argmax(item_int_target_atten, axis=1, output_type=tf.int32) + tf.range(
+                                tf.shape(batch_item_list_int_emb)[0]) * num_heads)
+
+        # (batch_size, embedding_dim)
+        self.user_con_att_emb = tf.reshape(self.user_con_embeddings, [batch_size, embedding_dim])
+
+        # 最终的user_emb (batch_size, 2 * embedding_dim) 用来计算最后的点积softmax loss不用作serving
+        self.user_embeddings_var = tf.concat([self.user_int_att_emb,
+                                              self.user_con_att_emb], axis=1)
+
+        # 以下为负采样部分
+        batch_neg_num = neg_num * batch_size
+        self.sampled_batch_neg_items, self.pos_q, self.neg_q = tf.nn.log_uniform_candidate_sampler(true_classes=tf.cast(tf.reshape(self.item_batch_input, [-1, 1]), tf.int64),
+                                            num_true=1, num_sampled=batch_neg_num, unique=True,
+                                            range_max=n_mid)
+
+        # 计算整体的logits和labels
+        self.main_logits, self.main_labels = _compute_sampled_logits(self.item_embeddings_var, self.item_embeddings_bias,
+                        tf.reshape(self.item_batch_input, [-1, 1]), self.user_embeddings_var, batch_neg_num, n_mid,
+                        sampled_values=(self.sampled_batch_neg_items, self.pos_q, self.neg_q))
+        self.main_labels = tf.stop_gradient(self.main_labels, name="main_labels_stop_gradient")
+
+        # 计算从众部分logits和labels
+        self.con_pos_logits, self.con_pos_labels = _compute_sampled_logits(self.item_con_embeddings_var,
+                                                                     self.item_embeddings_bias,
+                                                                     tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                     self.user_con_att_emb, batch_neg_num, n_mid,
+                                                                     sampled_values=(
+                                                                     self.sampled_batch_neg_items, self.pos_q,
+                                                                     self.neg_q))
+        self.con_neg_logits, self.con_neg_labels = _compute_sampled_logits(-self.item_con_embeddings_var,
+                                                                           self.item_embeddings_bias,
+                                                                           tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                           self.user_con_att_emb, batch_neg_num, n_mid,
+                                                                           sampled_values=(
+                                                                               self.sampled_batch_neg_items, self.pos_q,
+                                                                               self.neg_q))
+        # 计算兴趣部分logits和labels
+        self.int_pos_logits, self.int_pos_labels = _compute_sampled_logits(self.item_int_embeddings_var,
+                                                                           self.item_embeddings_bias,
+                                                                           tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                           self.user_int_att_emb, batch_neg_num, n_mid,
+                                                                           sampled_values=(
+                                                                               self.sampled_batch_neg_items, self.pos_q,
+                                                                               self.neg_q))
+        self.int_neg_logits, self.int_neg_labels = _compute_sampled_logits(-self.item_int_embeddings_var,
+                                                                           self.item_embeddings_bias,
+                                                                           tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                           self.user_int_att_emb, batch_neg_num, n_mid,
+                                                                           sampled_values=(
+                                                                               self.sampled_batch_neg_items, self.pos_q,
+                                                                               self.neg_q))
+
+        # ----辅助loss部分-----
+        # 根据输入的一个batch的item_id从item_int_embeddings_var中lookup (batch_size * neg_num, embedding_dim)
+        self.batch_neg_item_int_embeddings = tf.nn.embedding_lookup(self.item_int_embeddings_var, self.sampled_batch_neg_items)
+
+        # 根据输入的一个batch的item_id从item_con_embeddings_var中lookup (batch_size * neg_num, embedding_dim)
+        self.batch_neg_item_con_embeddings = tf.nn.embedding_lookup(self.item_con_embeddings_var, self.sampled_batch_neg_items)
+
+        # 正样本的频率 (batch_size, )
+        self.batch_pos_freq = self.item_freq_dict.lookup(self.batch_pos_items)
+
+        # 负样本的频率 (batch_size * neg_num, )
+        self.batch_neg_freq = self.item_freq_dict.lookup(tf.cast(self.sampled_batch_neg_items, tf.int32))
+
+        # 历史序列的类别矩阵 (batch_size, max_len)
+        self.batch_hist_item_cate = self.item_cate_dict.lookup(self.item_his_batch_input)
+
+        # 正样本的类别矩阵 (batch_size, )
+        self.batch_pos_item_cate = self.item_cate_dict.lookup(self.batch_pos_items)
+
+        # 负样本的类别矩阵 (neg_num * batch_size, )
+        self.batch_neg_item_cate = self.item_cate_dict.lookup(tf.cast(self.sampled_batch_neg_items, tf.int32))
+
+        # 拆分因果数据集用mask表示 (batch_size, batch_size * neg_num)
+        self.neg_all_one_masks = tf.ones((self.batch_size, self.batch_size * self.neg_num))
+        self.neg_all_zero_masks = tf.zeros((self.batch_size, self.batch_size * self.neg_num))
+        self.neg_all_neg_ones_masks = -tf.ones((self.batch_size, self.batch_size * self.neg_num))
+
+        # 频率部分
+        # self.batch_pos_freq_tile: (batch_size, batch_size * neg_num)
+        self.batch_pos_freq_tile = tf.tile(tf.reshape(self.batch_pos_freq, (self.batch_size, 1)),
+                                           (1, self.batch_size * self.neg_num))
+        # self.batch_neg_freq_tile: (batch_size, batch_size * neg_num)
+        self.batch_neg_freq_tile = tf.tile(tf.reshape(self.batch_neg_freq, (1, self.batch_size * self.neg_num)),
+                                           (self.batch_size, 1))
+
+        # 类别部分
+        # batch_pos_item_cate_tile: (batch_size, seq_len)
+        self.batch_pos_item_cate_tile = tf.tile(tf.reshape(self.batch_pos_item_cate, (self.batch_size, 1)),
+                                                (1, self.seq_len))
+        # batch_neg_item_cate_tile: (neg_num * batch_size, batch_size, seq_len)
+        self.batch_neg_item_cate_tile = tf.tile(tf.reshape(self.batch_neg_item_cate, (self.batch_size * self.neg_num, 1, 1)),
+                                                (1, self.batch_size, self.seq_len))
+
+        # batch_hist_item_tile: (neg_num * batch_size, batch_size, seq_len)
+        self.batch_hist_item_cate_tile = tf.tile(tf.reshape(self.batch_hist_item_cate, (1, self.batch_size, self.seq_len)),
+                                            (self.neg_num * self.batch_size, 1, 1))
+
+        # pos_cate_diff (batch_size, seq_len) 如果有为0说明是
+        self.batch_pos_hist_item_cate_sub = self.batch_pos_item_cate_tile - self.batch_hist_item_cate
+
+        # neg_cate_diff (neg_num * batch_size, batch_size, seq_len)
+        self.batch_neg_hist_item_cate_sub = self.batch_neg_item_cate_tile - self.batch_hist_item_cate_tile
+
+        # neg_cate_equal_-1 如果类别是-1说明负采样到0，会和历史序列中补齐的0冲突，导致属于兴趣，需要做特判, 我们认为该负样本不属于用户兴趣，mask为False
+        self.batch_neg_item_cate_tile_only_batch = tf.tile(tf.reshape(self.batch_neg_item_cate,
+                                                                      (self.batch_size * self.neg_num, 1)),
+                                                           (1, self.batch_size))
+        # neg_cate_equal_neg_one: (neg_num * batch_size, batch_size)
+        self.neg_cate_equal_neg_one = tf.where(
+            tf.equal(self.batch_neg_item_cate_tile_only_batch, -tf.ones_like(self.batch_neg_item_cate_tile_only_batch)),
+            tf.fill(self.batch_neg_item_cate_tile_only_batch.shape, False),
+            tf.fill(self.batch_neg_item_cate_tile_only_batch.shape, True))
+
+        # 正样本类别和历史序列类别重复mask矩阵 1为相同 0为不相同 (batch_size, seq_len)
+        self.pos_hist_same_mask = tf.where(tf.equal(self.batch_pos_hist_item_cate_sub, tf.zeros_like(self.batch_pos_hist_item_cate_sub)),
+                                           tf.ones_like(self.batch_pos_hist_item_cate_sub), tf.zeros_like(self.batch_pos_hist_item_cate_sub))
+
+        # 负样本和历史序列类别重复mask矩阵 1为相同 0为不相同 (neg_num * batch_size, batch_size, seq_len)
+        self.neg_hist_same_mask = tf.where(tf.equal(self.batch_neg_hist_item_cate_sub, tf.zeros_like(self.batch_neg_hist_item_cate_sub)),
+                                           tf.ones_like(self.batch_neg_hist_item_cate_sub), tf.zeros_like(self.batch_neg_hist_item_cate_sub))
+
+        self.mask_sum = tf.reduce_sum(self.mask, axis=1)
+        # 防止mask中出现0
+        self.mask_sum = tf.where(tf.equal(self.mask_sum, tf.zeros_like(self.mask_sum)), tf.ones_like(self.mask_sum), self.mask_sum)
+
+        # 正样本相同占比概率 (batch_size, )
+        self.pos_hist_same_mask = tf.cast(self.pos_hist_same_mask, tf.float32)
+
+        self.pos_hist_same_prop = tf.math.divide(tf.reduce_sum(self.pos_hist_same_mask, axis=1), self.mask_sum)
+        # print(self.pos_hist_same_prop)
+
+        # 负样本相同占比概率 (batch_size * neg_num, batch_size)
+        self.neg_hist_same_mask = tf.cast(self.neg_hist_same_mask, tf.float32)
+        self.neg_hist_same_prop = tf.math.divide(tf.reduce_sum(self.neg_hist_same_mask, axis=2),
+                                                        tf.cast(tf.tile(tf.reshape(self.mask_sum, (1, self.batch_size))
+                                                                , (self.batch_size * self.neg_num, 1)), tf.float32))
+        # 正样本属于用户兴趣mask (batch_size, )
+        self.pos_belong_user_int_mask = tf.where(tf.greater(self.pos_hist_same_prop, self.cate_prop * tf.ones_like(self.pos_hist_same_prop)),
+                                                 tf.fill(self.pos_hist_same_prop.shape, True),
+                                                 tf.fill(self.pos_hist_same_prop.shape, False))
+        # (self.neg_num * self.batch_size, batch_size)
+        self.pos_belong_user_int_mask_tile = tf.tile(tf.reshape(self.pos_belong_user_int_mask, (1, self.batch_size)),
+                                                     (self.neg_num * self.batch_size, 1))
+
+
+        # 负样本属于用户兴趣mask (batch_size * neg_num, batch_size) prop > cate_prop
+        self.neg_belong_user_int_mask = tf.where(tf.greater(self.neg_hist_same_prop, self.cate_prop * tf.ones_like(self.neg_hist_same_prop)),
+                                                 tf.fill(self.neg_hist_same_prop.shape, True),
+                                                 tf.fill(self.neg_hist_same_prop.shape, False))
+        self.neg_belong_user_int_mask = self.neg_belong_user_int_mask & self.neg_cate_equal_neg_one
+
+        self.pos_belong_user_int_mask_tile = tf.transpose(self.pos_belong_user_int_mask_tile, [1, 0])
+        self.neg_belong_user_int_mask = tf.transpose(self.neg_belong_user_int_mask, [1, 0])
+
+        # 第一层频数判断 1为正样本大于负样本 -1为正样本小于等于负样本 (batch_size, batch_size * neg_num)
+        self.conformity_mask = tf.where(tf.less_equal(self.batch_pos_freq_tile, self.batch_neg_freq_tile),
+                                        -tf.ones_like(self.batch_pos_freq_tile),
+                                        tf.ones_like(self.batch_pos_freq_tile))
+
+        # 第二层兴趣判断 0为无法判断 1为正样本大于负样本 -1为正样本小于负样本 (batch_size, batch_size * neg_num)
+
+        self.interest_mask = tf.where(tf.equal(self.conformity_mask, -tf.ones_like(self.conformity_mask)),
+                                      tf.fill(self.conformity_mask.shape, 1),
+                                      tf.where(
+                                          tf.equal(self.pos_belong_user_int_mask_tile, self.neg_belong_user_int_mask),
+                                          tf.fill(self.pos_belong_user_int_mask_tile.shape, 0),
+                                          tf.where(self.pos_belong_user_int_mask_tile,
+                                                   tf.fill(self.pos_belong_user_int_mask_tile.shape, 1),
+                                                   tf.fill(self.pos_belong_user_int_mask_tile.shape, -1))
+                                      ))
+
+        self.conformity_mask = tf.cast(self.conformity_mask, tf.float32)
+        self.interest_mask = tf.cast(self.interest_mask, tf.float32)
+
+        # 正样本的mask 和输入的mask进行拼接
+        self.mask_pos_gt_neg = tf.ones((batch_size, 1))
+        self.mask_pos_lt_neg = -tf.ones((batch_size, 1))
+
+        self.con_pos_mask = tf.concat([self.mask_pos_gt_neg, self.conformity_mask], axis=1)
+        self.con_neg_mask = tf.concat([self.mask_pos_lt_neg, self.conformity_mask], axis=1)
+
+        self.con_pos_mask = tf.where(tf.equal(self.con_pos_mask, tf.ones_like(self.con_pos_mask)),
+                                     tf.ones_like(self.con_pos_mask),
+                                     tf.zeros_like(self.con_pos_mask))
+        self.con_neg_mask = tf.where(tf.equal(self.con_neg_mask, -tf.ones_like(self.con_neg_mask)),
+                                     tf.ones_like(self.con_neg_mask),
+                                     tf.zeros_like(self.con_neg_mask))
+
+        self.int_pos_mask = tf.concat([self.mask_pos_gt_neg, self.interest_mask], axis=1)
+        self.int_neg_mask = tf.concat([self.mask_pos_lt_neg, self.interest_mask], axis=1)
+
+        self.int_pos_mask = tf.where(tf.equal(self.int_pos_mask, tf.ones_like(self.int_pos_mask)),
+                                     tf.ones_like(self.int_pos_mask),
+                                     tf.zeros_like(self.int_pos_mask))
+        self.int_neg_mask = tf.where(tf.equal(self.int_neg_mask, -tf.ones_like(self.int_neg_mask)),
+                                     tf.ones_like(self.int_neg_mask),
+                                     tf.zeros_like(self.int_neg_mask))
+
+        # int和con 区分loss
+        self.batch_pos_items = tf.reshape(self.item_batch_input, [-1, ])
+        self.batch_neg_items = tf.cast(tf.reshape(self.sampled_batch_neg_items, [-1, ]), tf.int32)
+        self.batch_item_all = tf.unique(tf.concat([self.batch_pos_items, self.batch_neg_items], axis=0))[0]
+
+        self.batch_item_int = tf.gather(self.item_int_embeddings_var, self.batch_item_all)
+        self.batch_item_con = tf.gather(self.item_con_embeddings_var, self.batch_item_all)
+
+        self.build_loss()
 
 
 class InterestCapsuleNetwork(tf.layers.Layer):
@@ -568,10 +913,317 @@ class InterestCapsuleNetwork(tf.layers.Layer):
 
 
 class Model_MiceRecDR(Basic_Model):
-    """
-    Due to the time conflict of the company's patent application, 
-    the details of the model part are temporarily invisible. 
-    We will add all the codes after the patent application is successful. 
-    It is expected to be March 2022.
-    Thanks for your patience.
-    """
+    def __init__(self, n_mid, embedding_dim, hidden_size, batch_size, num_interest, item_cate,
+                 item_freq, cate_prop=0, seq_len=256, neg_num=10, hard_readout=True,
+                 con_att=True, relu_layer=False, con_gt_loss_weight=0.1, con_lt_loss_weight=0.1, int_gt_loss_weight=0.1,
+                 int_lt_loss_weight=0.1, dis_loss_weight=0.01, weight_decay=0.9, dis_loss_type='cos'):
+        super(Model_MiceRecDR, self).__init__(n_mid, embedding_dim, hidden_size, batch_size, seq_len, neg_num, item_cate,
+                 item_freq, cate_prop, dis_loss_type, flag="MiceRec_DR")
+        # embedding维度
+        self.dim = embedding_dim
+        self.con_att = con_att
+        self.seq_len = seq_len
+        self.con_gt_loss_weight = con_gt_loss_weight
+        self.con_lt_loss_weight = con_lt_loss_weight
+        self.int_gt_loss_weight = int_gt_loss_weight
+        self.int_lt_loss_weight = int_lt_loss_weight
+        self.dis_loss_weight = dis_loss_weight
+        self.weight_decay = weight_decay
+
+        # (batch_size, max_len, embedding_dim)
+        batch_item_list_int_emb = tf.reshape(self.batch_item_hist_int_embeddings, [-1, seq_len, embedding_dim])
+        batch_item_list_con_emb = tf.reshape(self.batch_item_hist_con_embeddings, [-1, seq_len, embedding_dim])
+
+        # user从众侧的embedding
+        if con_att:
+            # user从众侧添加self-attention进行降维 (batch_size, max_len, 4 * hidden_size)
+            user_con_item_hidden = tf.layers.dense(batch_item_list_con_emb, hidden_size * 4, activation=tf.nn.tanh)
+
+            # (batch_size, max_len, 1)
+            user_con_item_att_w = tf.layers.dense(user_con_item_hidden, 1, activation=None)
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+
+            # (batch_size, 1, max_len)
+            user_con_item_att_w = tf.transpose(user_con_item_att_w, [0, 2, 1])
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+
+            # tf.expand_dims(self.mask, axis=1) -> (batch_size, 1, max_len)
+            # atten_mask -> (batch_size, 1, max_len)
+            user_con_atten_mask = tf.tile(tf.expand_dims(self.mask, axis=1), [1, 1, 1])
+            # print('user_con_atten_mask shape:', user_con_atten_mask.shape)
+
+            # paddings: (batch_size, 1, max_len)
+            user_con_paddings = tf.ones_like(user_con_atten_mask) * (-2 ** 32 + 1)
+            # print('user_con_paddings shape:', user_con_paddings.shape)
+
+            # item_att_w: (batch_size, 1, max_len)
+            user_con_item_att_w = tf.where(tf.equal(user_con_atten_mask, 0), user_con_paddings, user_con_item_att_w)
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+
+            # item_att_w: (batch_size, 1, max_len)
+            user_con_item_att_w = tf.nn.softmax(user_con_item_att_w)
+
+            # interest_emb: (batch_size, 1, embedding_dim)
+            # print('user_con_item_att_w shape:', user_con_item_att_w.shape)
+            # print('batch_item_list_con_emb:', batch_item_list_con_emb.shape)
+            user_conformity_emb = tf.matmul(user_con_item_att_w, batch_item_list_con_emb)
+            # print('user_conformity_emb:', user_conformity_emb.shape)
+
+        else:
+            # user从众直接添加全连接进行降维 先把user_con_item摊平 (batch_size, max_len * embedding_dim)
+            batch_item_list_con_add_pos_flatten = tf.reshape(batch_item_list_con_emb,
+                                                             [batch_size, self.seq_len * embedding_dim])
+            # (batch_size, embedding_dim)
+            user_con_item_hidden = tf.layers.dense(batch_item_list_con_add_pos_flatten, embedding_dim,
+                                                   activation=tf.nn.relu)
+
+            # (batch_size, 1, embedding_dim)
+            user_conformity_emb = tf.reshape(user_con_item_hidden, [batch_size, 1, embedding_dim])
+
+        # (batch_size, 1, embedding_dim)
+        self.user_con_embeddings = user_conformity_emb
+
+        capsule_network = InterestCapsuleNetwork(hidden_size, seq_len, bilinear_type=2, num_interest=num_interest,
+                                         hard_readout=hard_readout, relu_layer=relu_layer)
+
+        # user兴趣抽取: (batch_size, num_interest, embedding_dim)
+        user_interest_emb = capsule_network(batch_item_list_int_emb, self.mask)
+
+        # user_int_embeddings: (batch_size, num_interest, embedding_dim)
+        self.user_int_embeddings = user_interest_emb
+
+        # 得到serving阶段的user embedding (batch_size, num_heads + 1, embedding_dim)
+        self.user_embeddings = tf.concat([self.user_con_embeddings, self.user_int_embeddings], axis=1)
+
+        # user兴趣侧 target-aware attention key,value为user_int_embeddings, query为target item 的兴趣embedding
+        # self.user_int_embeddings (batch_size, num_heads, embedding_dim)
+
+        # user_int_embeddings: (batch_size, num_heads, embedding_dim), batch_item_int_embeddings: (batch_size, embedding_dim)
+        # batch_item_list_int_emb: (batch_size, max_len, embedding_dim), get_shape(item_list_emb)[0] = batch_size
+        # tf.reshape(self.batch_item_int_embeddings, [get_shape(batch_item_list_int_emb)[0], self.dim, 1]): (batch_size, embedding_dim, 1)
+        # item_int_target_atten: (batch_size, num_heads, 1)
+        item_int_target_atten = tf.matmul(self.user_int_embeddings, tf.reshape(self.batch_item_int_embeddings,
+                                                                               [get_shape(batch_item_list_int_emb)[0],
+                                                                                self.dim, 1]))
+
+        # tf.reshape(item_int_target_atten, [get_shape(batch_item_list_int_emb)[0], num_heads]): (batch_size, num_heads)
+        # tf.pow(tf.reshape(item_int_target_atten, [get_shape(batch_item_list_int_emb)[0], num_heads]), 1): (batch_size, num_heads)
+        # item_int_target_atten: (batch_size, num_heads)
+        item_int_target_atten = tf.nn.softmax(tf.pow(tf.reshape(item_int_target_atten,
+                                                                [get_shape(batch_item_list_int_emb)[0], num_interest]), 1))
+
+        # tf.reshape(self.user_eb, [-1, self.dim]): (batch_size * num_heads, embedding_dim)
+        # tf.argmax(atten, axis=1, output_type=tf.int32): (batch_size, )
+        # tf.range(tf.shape(item_list_emb)[0]) (batch_size, )
+        # user_int_att_emb: (batch_size, embedding_dim)
+        self.user_int_att_emb = tf.gather(tf.reshape(self.user_int_embeddings, [-1, self.dim]),
+                                          tf.argmax(item_int_target_atten, axis=1, output_type=tf.int32) + tf.range(
+                                              tf.shape(batch_item_list_int_emb)[0]) * num_interest)
+
+        # (batch_size, embedding_dim)
+        self.user_con_att_emb = tf.reshape(self.user_con_embeddings, [batch_size, embedding_dim])
+
+        # 最终的user_emb (batch_size, 2 * embedding_dim) 用来计算最后的点积softmax loss不用作serving
+        self.user_embeddings_var = tf.concat([self.user_int_att_emb, self.user_con_att_emb],
+                                             axis=1)
+
+        # 以下为负采样部分
+        batch_neg_num = neg_num * batch_size
+        self.sampled_batch_neg_items, self.pos_q, self.neg_q = tf.nn.log_uniform_candidate_sampler(true_classes=tf.cast(tf.reshape(self.item_batch_input, [-1, 1]), tf.int64),
+                                            num_true=1, num_sampled=batch_neg_num, unique=True,
+                                            range_max=n_mid)
+
+        # 计算整体的logits和labels
+        self.main_logits, self.main_labels = _compute_sampled_logits(self.item_embeddings_var, self.item_embeddings_bias,
+                        tf.reshape(self.item_batch_input, [-1, 1]), self.user_embeddings_var, batch_neg_num, n_mid,
+                        sampled_values=(self.sampled_batch_neg_items, self.pos_q, self.neg_q))
+        self.main_labels = tf.stop_gradient(self.main_labels, name="main_labels_stop_gradient")
+
+        # 计算从众部分logits和labels
+        self.con_pos_logits, self.con_pos_labels = _compute_sampled_logits(self.item_con_embeddings_var,
+                                                                     self.item_embeddings_bias,
+                                                                     tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                     self.user_con_att_emb, batch_neg_num, n_mid,
+                                                                     sampled_values=(
+                                                                     self.sampled_batch_neg_items, self.pos_q,
+                                                                     self.neg_q))
+        self.con_neg_logits, self.con_neg_labels = _compute_sampled_logits(-self.item_con_embeddings_var,
+                                                                           self.item_embeddings_bias,
+                                                                           tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                           self.user_con_att_emb, batch_neg_num, n_mid,
+                                                                           sampled_values=(
+                                                                               self.sampled_batch_neg_items, self.pos_q,
+                                                                               self.neg_q))
+        # 计算兴趣部分logits和labels
+        self.int_pos_logits, self.int_pos_labels = _compute_sampled_logits(self.item_int_embeddings_var,
+                                                                           self.item_embeddings_bias,
+                                                                           tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                           self.user_int_att_emb, batch_neg_num, n_mid,
+                                                                           sampled_values=(
+                                                                               self.sampled_batch_neg_items, self.pos_q,
+                                                                               self.neg_q))
+        self.int_neg_logits, self.int_neg_labels = _compute_sampled_logits(-self.item_int_embeddings_var,
+                                                                           self.item_embeddings_bias,
+                                                                           tf.reshape(self.item_batch_input, [-1, 1]),
+                                                                           self.user_int_att_emb, batch_neg_num, n_mid,
+                                                                           sampled_values=(
+                                                                               self.sampled_batch_neg_items, self.pos_q,
+                                                                               self.neg_q))
+
+        # ----辅助loss部分-----
+        # 根据输入的一个batch的item_id从item_int_embeddings_var中lookup (batch_size * neg_num, embedding_dim)
+        self.batch_neg_item_int_embeddings = tf.nn.embedding_lookup(self.item_int_embeddings_var, self.sampled_batch_neg_items)
+
+        # 根据输入的一个batch的item_id从item_con_embeddings_var中lookup (batch_size * neg_num, embedding_dim)
+        self.batch_neg_item_con_embeddings = tf.nn.embedding_lookup(self.item_con_embeddings_var, self.sampled_batch_neg_items)
+
+        # 正样本的频率 (batch_size, )
+        self.batch_pos_freq = self.item_freq_dict.lookup(self.batch_pos_items)
+
+        # 负样本的频率 (batch_size * neg_num, )
+        self.batch_neg_freq = self.item_freq_dict.lookup(tf.cast(self.sampled_batch_neg_items, tf.int32))
+
+        # 历史序列的类别矩阵 (batch_size, max_len)
+        self.batch_hist_item_cate = self.item_cate_dict.lookup(self.item_his_batch_input)
+
+        # 正样本的类别矩阵 (batch_size, )
+        self.batch_pos_item_cate = self.item_cate_dict.lookup(self.batch_pos_items)
+
+        # 负样本的类别矩阵 (neg_num * batch_size, )
+        self.batch_neg_item_cate = self.item_cate_dict.lookup(tf.cast(self.sampled_batch_neg_items, tf.int32))
+
+        # 拆分因果数据集用mask表示 (batch_size, batch_size * neg_num)
+        self.neg_all_one_masks = tf.ones((self.batch_size, self.batch_size * self.neg_num))
+        self.neg_all_zero_masks = tf.zeros((self.batch_size, self.batch_size * self.neg_num))
+        self.neg_all_neg_ones_masks = -tf.ones((self.batch_size, self.batch_size * self.neg_num))
+
+        # 频率部分
+        # self.batch_pos_freq_tile: (batch_size, batch_size * neg_num)
+        self.batch_pos_freq_tile = tf.tile(tf.reshape(self.batch_pos_freq, (self.batch_size, 1)),
+                                           (1, self.batch_size * self.neg_num))
+        # self.batch_neg_freq_tile: (batch_size, batch_size * neg_num)
+        self.batch_neg_freq_tile = tf.tile(tf.reshape(self.batch_neg_freq, (1, self.batch_size * self.neg_num)),
+                                           (self.batch_size, 1))
+
+        # 类别部分
+        # batch_pos_item_cate_tile: (batch_size, seq_len)
+        self.batch_pos_item_cate_tile = tf.tile(tf.reshape(self.batch_pos_item_cate, (self.batch_size, 1)),
+                                                (1, self.seq_len))
+        # batch_neg_item_cate_tile: (neg_num * batch_size, batch_size, seq_len)
+        self.batch_neg_item_cate_tile = tf.tile(tf.reshape(self.batch_neg_item_cate, (self.batch_size * self.neg_num, 1, 1)),
+                                                (1, self.batch_size, self.seq_len))
+
+        # batch_hist_item_tile: (neg_num * batch_size, batch_size, seq_len)
+        self.batch_hist_item_cate_tile = tf.tile(tf.reshape(self.batch_hist_item_cate, (1, self.batch_size, self.seq_len)),
+                                            (self.neg_num * self.batch_size, 1, 1))
+
+        # pos_cate_diff (batch_size, seq_len) 如果有为0说明是
+        self.batch_pos_hist_item_cate_sub = self.batch_pos_item_cate_tile - self.batch_hist_item_cate
+
+        # neg_cate_diff (neg_num * batch_size, batch_size, seq_len)
+        self.batch_neg_hist_item_cate_sub = self.batch_neg_item_cate_tile - self.batch_hist_item_cate_tile
+
+        # neg_cate_equal_-1 如果类别是-1说明负采样到0，会和历史序列中补齐的0冲突，导致属于兴趣，需要做特判, 我们认为该负样本不属于用户兴趣，mask为False
+        self.batch_neg_item_cate_tile_only_batch = tf.tile(tf.reshape(self.batch_neg_item_cate,
+                                                                      (self.batch_size * self.neg_num, 1)),
+                                                           (1, self.batch_size))
+        # neg_cate_equal_neg_one: (neg_num * batch_size, batch_size)
+        self.neg_cate_equal_neg_one = tf.where(
+            tf.equal(self.batch_neg_item_cate_tile_only_batch, -tf.ones_like(self.batch_neg_item_cate_tile_only_batch)),
+            tf.fill(self.batch_neg_item_cate_tile_only_batch.shape, False),
+            tf.fill(self.batch_neg_item_cate_tile_only_batch.shape, True))
+
+        # 正样本类别和历史序列类别重复mask矩阵 1为相同 0为不相同 (batch_size, seq_len)
+        self.pos_hist_same_mask = tf.where(tf.equal(self.batch_pos_hist_item_cate_sub, tf.zeros_like(self.batch_pos_hist_item_cate_sub)),
+                                           tf.ones_like(self.batch_pos_hist_item_cate_sub), tf.zeros_like(self.batch_pos_hist_item_cate_sub))
+
+        # 负样本和历史序列类别重复mask矩阵 1为相同 0为不相同 (neg_num * batch_size, batch_size, seq_len)
+        self.neg_hist_same_mask = tf.where(tf.equal(self.batch_neg_hist_item_cate_sub, tf.zeros_like(self.batch_neg_hist_item_cate_sub)),
+                                           tf.ones_like(self.batch_neg_hist_item_cate_sub), tf.zeros_like(self.batch_neg_hist_item_cate_sub))
+
+        self.mask_sum = tf.reduce_sum(self.mask, axis=1)
+        # 防止mask中出现0
+        self.mask_sum = tf.where(tf.equal(self.mask_sum, tf.zeros_like(self.mask_sum)), tf.ones_like(self.mask_sum), self.mask_sum)
+
+        # 正样本相同占比概率 (batch_size, )
+        self.pos_hist_same_mask = tf.cast(self.pos_hist_same_mask, tf.float32)
+
+        self.pos_hist_same_prop = tf.math.divide(tf.reduce_sum(self.pos_hist_same_mask, axis=1), self.mask_sum)
+        # print(self.pos_hist_same_prop)
+
+        # 负样本相同占比概率 (batch_size * neg_num, batch_size)
+        self.neg_hist_same_mask = tf.cast(self.neg_hist_same_mask, tf.float32)
+        self.neg_hist_same_prop = tf.math.divide(tf.reduce_sum(self.neg_hist_same_mask, axis=2),
+                                                        tf.cast(tf.tile(tf.reshape(self.mask_sum, (1, self.batch_size))
+                                                                , (self.batch_size * self.neg_num, 1)), tf.float32))
+        # 正样本属于用户兴趣mask (batch_size, )
+        self.pos_belong_user_int_mask = tf.where(tf.greater(self.pos_hist_same_prop, self.cate_prop * tf.ones_like(self.pos_hist_same_prop)),
+                                                 tf.fill(self.pos_hist_same_prop.shape, True),
+                                                 tf.fill(self.pos_hist_same_prop.shape, False))
+        # (self.neg_num * self.batch_size, batch_size)
+        self.pos_belong_user_int_mask_tile = tf.tile(tf.reshape(self.pos_belong_user_int_mask, (1, self.batch_size)),
+                                                     (self.neg_num * self.batch_size, 1))
+
+
+        # 负样本属于用户兴趣mask (batch_size * neg_num, batch_size) prop > cate_prop
+        self.neg_belong_user_int_mask = tf.where(tf.greater(self.neg_hist_same_prop, self.cate_prop * tf.ones_like(self.neg_hist_same_prop)),
+                                                 tf.fill(self.neg_hist_same_prop.shape, True),
+                                                 tf.fill(self.neg_hist_same_prop.shape, False))
+        self.neg_belong_user_int_mask = self.neg_belong_user_int_mask & self.neg_cate_equal_neg_one
+
+        self.pos_belong_user_int_mask_tile = tf.transpose(self.pos_belong_user_int_mask_tile, [1, 0])
+        self.neg_belong_user_int_mask = tf.transpose(self.neg_belong_user_int_mask, [1, 0])
+
+        # 第一层频数判断 1为正样本大于负样本 -1为正样本小于等于负样本 (batch_size, batch_size * neg_num)
+        self.conformity_mask = tf.where(tf.less_equal(self.batch_pos_freq_tile, self.batch_neg_freq_tile),
+                                        -tf.ones_like(self.batch_pos_freq_tile),
+                                        tf.ones_like(self.batch_pos_freq_tile))
+
+        # 第二层兴趣判断 0为无法判断 1为正样本大于负样本 -1为正样本小于负样本 (batch_size, batch_size * neg_num)
+
+        self.interest_mask = tf.where(tf.equal(self.conformity_mask, -tf.ones_like(self.conformity_mask)),
+                                      tf.fill(self.conformity_mask.shape, 1),
+                                      tf.where(
+                                          tf.equal(self.pos_belong_user_int_mask_tile, self.neg_belong_user_int_mask),
+                                          tf.fill(self.pos_belong_user_int_mask_tile.shape, 0),
+                                          tf.where(self.pos_belong_user_int_mask_tile,
+                                                   tf.fill(self.pos_belong_user_int_mask_tile.shape, 1),
+                                                   tf.fill(self.pos_belong_user_int_mask_tile.shape, -1))
+                                      ))
+
+        self.conformity_mask = tf.cast(self.conformity_mask, tf.float32)
+        self.interest_mask = tf.cast(self.interest_mask, tf.float32)
+
+        # 正样本的mask 和输入的mask进行拼接
+        self.mask_pos_gt_neg = tf.ones((batch_size, 1))
+        self.mask_pos_lt_neg = -tf.ones((batch_size, 1))
+
+        self.con_pos_mask = tf.concat([self.mask_pos_gt_neg, self.conformity_mask], axis=1)
+        self.con_neg_mask = tf.concat([self.mask_pos_lt_neg, self.conformity_mask], axis=1)
+
+        self.con_pos_mask = tf.where(tf.equal(self.con_pos_mask, tf.ones_like(self.con_pos_mask)),
+                                     tf.ones_like(self.con_pos_mask),
+                                     tf.zeros_like(self.con_pos_mask))
+        self.con_neg_mask = tf.where(tf.equal(self.con_neg_mask, -tf.ones_like(self.con_neg_mask)),
+                                     tf.ones_like(self.con_neg_mask),
+                                     tf.zeros_like(self.con_neg_mask))
+
+        self.int_pos_mask = tf.concat([self.mask_pos_gt_neg, self.interest_mask], axis=1)
+        self.int_neg_mask = tf.concat([self.mask_pos_lt_neg, self.interest_mask], axis=1)
+
+        self.int_pos_mask = tf.where(tf.equal(self.int_pos_mask, tf.ones_like(self.int_pos_mask)),
+                                     tf.ones_like(self.int_pos_mask),
+                                     tf.zeros_like(self.int_pos_mask))
+        self.int_neg_mask = tf.where(tf.equal(self.int_neg_mask, -tf.ones_like(self.int_neg_mask)),
+                                     tf.ones_like(self.int_neg_mask),
+                                     tf.zeros_like(self.int_neg_mask))
+
+        # int和con 区分loss
+        self.batch_pos_items = tf.reshape(self.item_batch_input, [-1, ])
+        self.batch_neg_items = tf.cast(tf.reshape(self.sampled_batch_neg_items, [-1, ]), tf.int32)
+        self.batch_item_all = tf.unique(tf.concat([self.batch_pos_items, self.batch_neg_items], axis=0))[0]
+
+        self.batch_item_int = tf.gather(self.item_int_embeddings_var, self.batch_item_all)
+        self.batch_item_con = tf.gather(self.item_con_embeddings_var, self.batch_item_all)
+
+        self.build_loss()
